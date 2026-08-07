@@ -1,0 +1,4 @@
+dist/
+firmware/*.elf
+firmware/*.map
+.venv/

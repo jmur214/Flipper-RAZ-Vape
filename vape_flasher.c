@@ -5,9 +5,9 @@
  * inside a RAZ DC25000 disposable vape via bit-banged ARM SWD on GPIO pins.
  *
  * Wiring (Flipper GPIO → USB-C cable → vape CC lines):
- *   Flipper PA7  (GPIO pin 11) → CC1 → SWDIO
- *   Flipper PA6  (GPIO pin  9) → CC2 → SWCLK
- *   Flipper GND                → GND   → USB-C GND shell
+ *   Flipper PA7  (GPIO header pin 2, label "A7") → CC1 → SWDIO
+ *   Flipper PA6  (GPIO header pin 3, label "A6") → CC2 → SWCLK
+ *   Flipper GND  (pin 8 or 18, label "GND")      → GND → USB-C GND shell
  *
  * The vape is self-powered; USB-C carries only SWD signals and GND.
  *
@@ -323,9 +323,9 @@ static void draw_wiring(Canvas* canvas) {
     canvas_draw_str(canvas, 2, 23, "Flipper    USB-C   Signal");
     /* Separator */
     canvas_draw_line(canvas, 2, 25, 126, 25);
-    canvas_draw_str(canvas, 2, 34, "PA7 pin11  CC1     SWDIO");
-    canvas_draw_str(canvas, 2, 44, "PA6 pin 9  CC2     SWCLK");
-    canvas_draw_str(canvas, 2, 54, "GND        GND shell");
+    canvas_draw_str(canvas, 2, 34, "A7 (pin 2)  CC1    SWDIO");
+    canvas_draw_str(canvas, 2, 44, "A6 (pin 3)  CC2    SWCLK");
+    canvas_draw_str(canvas, 2, 54, "GND (pin 8) GND");
 
     canvas_draw_str(canvas, 2, 63, "[OK] Next   [Back] Back");
 }

@@ -5,9 +5,9 @@
  * Host:    Flipper Zero (STM32WB55, 64 MHz)
  *
  * Pin wiring (Flipper GPIO header → USB-C plug on vape):
- *   Flipper PA7  (GPIO header pin 11)  →  SWDIO  →  USB-C CC1
- *   Flipper PA6  (GPIO header pin  9)  →  SWCLK  →  USB-C CC2
- *   Flipper GND  (GPIO header GND)     →  GND    →  USB-C GND shell
+ *   Flipper PA7  (header pin 2, label "A7")  →  SWDIO  →  USB-C CC1
+ *   Flipper PA6  (header pin 3, label "A6")  →  SWCLK  →  USB-C CC2
+ *   Flipper GND  (header pin 8 or 18)        →  GND    →  USB-C GND shell
  *
  * The vape is self-powered; USB-C carries only the CC/SWD signals.
  *

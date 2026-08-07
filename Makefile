@@ -80,9 +80,21 @@ firmware/template.bin: firmware/template.elf
 .PHONY: template
 template: firmware/template.bin
 
+# ── dino ──────────────────────────────────────────────────────────────────────
+firmware/dino.elf: $(VAPORWARE_SRC) vaporware/examples/dino/src/dino.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $^ -o $@
+	$(SIZE) $@
+
+firmware/dino.bin: firmware/dino.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: dino
+dino: firmware/dino.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template
+all: flappy slots template dino
 
 .PHONY: clean
 clean:
