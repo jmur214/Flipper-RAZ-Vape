@@ -699,6 +699,17 @@ FlashResult n32_flash_program(
         }
 
         if(actual != expected) {
+            /* Re-read once before calling it a mismatch.  A single bad read
+             * during a long verify pass is far likelier than a single bad word
+             * in flash that programmed without error, and a genuine mismatch
+             * reproduces. */
+            uint32_t confirm = 0;
+            if(flash_read32(flash_addr, &confirm) == FLASH_OK) {
+                actual = confirm;
+            }
+        }
+
+        if(actual != expected) {
             /* Capture the first mismatch so the UI can show what actually came
              * back — 0xFFFFFFFF means nothing was programmed there, a shifted
              * or byte-swapped value means a lane/ordering bug, and a partial

@@ -908,23 +908,30 @@ SWDAck swd_read16(uint32_t addr, uint16_t* out) {
 }
 
 SWDAck swd_read32(uint32_t addr, uint32_t* out) {
-    SWDAck result = swd_set_csw(CSW_SIZE_32);
-    if(result != SWD_ACK_OK) return result;
-
-    /* Write TAR with the target address */
-    result = swd_ap_write(AP_REG_TAR, addr);
-    if(result != SWD_ACK_OK) return result;
+    SWDAck result = SWD_ACK_OK;
 
     /*
-     * AP reads are pipelined:
-     *   1. Initiate the read of DRW — result is from previous read (stale).
-     *   2. Read DP RDBUFF — this captures the actual DRW data.
+     * An AP read is a three-transaction sequence (TAR, then the pipelined DRW
+     * read whose result is stale, then DP RDBUFF which carries the real data).
+     * The per-transaction WAIT/FAULT retries below cannot repair this: retrying
+     * one step mid-sequence leaves the pipeline out of step and RDBUFF returns
+     * a stale word.  So retry the WHOLE sequence instead.
      */
-    uint32_t discard = 0;
-    result = swd_ap_read(AP_REG_DRW, &discard);
-    if(result != SWD_ACK_OK) return result;
+    for(uint32_t attempt = 0; attempt < 3U; attempt++) {
+        result = swd_set_csw(CSW_SIZE_32);
+        if(result != SWD_ACK_OK) continue;
 
-    result = swd_dp_read(DP_REG_RDBUFF, out);
+        result = swd_ap_write(AP_REG_TAR, addr);
+        if(result != SWD_ACK_OK) continue;
+
+        uint32_t discard = 0;
+        result = swd_ap_read(AP_REG_DRW, &discard);
+        if(result != SWD_ACK_OK) continue;
+
+        result = swd_dp_read(DP_REG_RDBUFF, out);
+        if(result == SWD_ACK_OK) return SWD_ACK_OK;
+    }
+
     return result;
 }
 
