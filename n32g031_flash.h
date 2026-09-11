@@ -137,6 +137,55 @@ bool n32_flash_identify(uint32_t* idcode_out);
  */
 const char* n32_flash_err_str(FlashResult r);
 
+/**
+ * Details of the first verify mismatch from the last n32_flash_program().
+ * Only meaningful when that call returned FLASH_ERR_VERIFY.
+ *
+ * An actual value of 0xFFFFFFFF means nothing was programmed at that address;
+ * a shifted or byte-swapped value points at a transfer-lane bug; a value that
+ * shares set bits with the expected one means the page was not fully erased.
+ */
+/* Flash controller state captured during the last programming pass: CTRL read
+ * back immediately after PG was set, and STS after the first data write. */
+uint32_t n32_flash_dbg_ctrl(void);
+uint32_t n32_flash_dbg_sts(void);
+
+/* SRAM loopback results from the last programming pass, proving which MEM-AP
+ * transfer widths actually reach the target.  Expect 0x5A5AA5A5 and
+ * 0xDEADBEEF respectively when both widths work. */
+/* Flash protection state read at the start of the last programming pass.
+ * OBR carries the read-protection level; WRPR is the write-protection mask
+ * (0xFFFFFFFF when no page is protected). */
+/* Address at which programming first reported an error, and the flash status
+ * register at that moment. */
+/* Erase-path state from the first page erase of the last programming pass:
+ * CTRL and ADD read back after the start trigger, STS sampled right after.
+ * BSY absent from STS means the erase never actually started. */
+/* Status captured after the first page erase completed, before it was
+ * cleared — bit 2 is PGERR, bit 4 WRPERR, bit 5 EOP. */
+uint32_t n32_flash_er_done(void);
+
+/* First word of the first erased page, sampled before and after that erase. */
+uint32_t n32_flash_er_pre(void);
+uint32_t n32_flash_er_post(void);
+
+uint32_t n32_flash_er_ctrl(void);
+uint32_t n32_flash_er_add(void);
+uint32_t n32_flash_er_sts(void);
+
+uint32_t n32_flash_fail_addr(void);
+uint32_t n32_flash_fail_sts(void);
+
+uint32_t n32_flash_dbg_obr(void);
+uint32_t n32_flash_dbg_wrpr(void);
+
+uint32_t n32_flash_dbg_ram16(void);
+uint32_t n32_flash_dbg_ram32(void);
+
+uint32_t n32_flash_verify_addr(void);
+uint32_t n32_flash_verify_expected(void);
+uint32_t n32_flash_verify_actual(void);
+
 #ifdef __cplusplus
 }
 #endif

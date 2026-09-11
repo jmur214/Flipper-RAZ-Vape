@@ -2,12 +2,12 @@
  * n32g031_flash.c — Flash programmer for N32G031K8Q7-1 via ARM SWD
  *
  * Target MCU : N32G031K8Q7-1 (ARM Cortex-M0)
- * Flash      : 64 KB @ 0x08000000, 1 KB pages, 64 pages
+ * Flash      : 64 KB @ 0x08000000, 512 B pages, 128 pages
  * SRAM       : 8 KB  @ 0x20000000
  * Flash ctrl : N32G031 register-compatible subset of STM32F0 flash IP
  *
- * NV storage: pages 60-63 (0x0800F000–0x0800FFFF) are read-only from the
- * perspective of this module.  The erase loop hard-stops at page 59.
+ * NV storage: pages 120-127 (0x0800F000–0x0800FFFF) are read-only from the
+ * perspective of this module.  The erase loop hard-stops at page 119.
  *
  * SWD access: every target memory read/write goes through swd_read32() /
  * swd_write32() from swd.h.  A non-OK ACK from either function causes the
@@ -46,6 +46,8 @@
 #define N32_FLASH_STS     (N32_FLASH_BASE + 0x0CU)  /* Status register               */
 #define N32_FLASH_CTRL    (N32_FLASH_BASE + 0x10U)  /* Control register              */
 #define N32_FLASH_ADD     (N32_FLASH_BASE + 0x14U)  /* Page-erase address register   */
+#define N32_FLASH_OBR     (N32_FLASH_BASE + 0x1CU)  /* Option byte register          */
+#define N32_FLASH_WRPR    (N32_FLASH_BASE + 0x20U)  /* Write protection register     */
 
 /* N32_FLASH_CTRL bits */
 #define N32_CTRL_PG    (1UL << 0)  /* Program enable                               */
@@ -69,12 +71,23 @@
  * ========================================================================= */
 
 #define N32_FLASH_ORIGIN      0x08000000UL   /* First byte of flash in target space  */
-#define N32_PAGE_SIZE         1024U          /* 1 KB per page                        */
-#define N32_TOTAL_PAGES       64U            /* 64 pages = 64 KB                     */
 
-/* NV region: pages 60-63 are reserved and must not be erased/written */
-#define N32_NV_FIRST_PAGE    60U             /* First NV page (inclusive)            */
-#define N32_MAX_USER_PAGES   60U             /* Pages 0-59 are user-writable         */
+/* Page size is 512 bytes, NOT the 1 KB this file originally assumed.
+ *
+ * Measured directly: after erasing one page, the first surviving word sat at
+ * offset 0x200.  A 1 KB assumption therefore erased only the first half of
+ * each page and left the second half holding data, so programming failed with
+ * PGERR the moment it crossed into a half that had never been cleared.
+ *
+ * The SDK's own nv.h agrees — it describes each NV key as owning "one
+ * dedicated 512-byte flash page", with the NV region starting at 0x0800F000
+ * (offset 61440 = page 120). */
+#define N32_PAGE_SIZE         512U           /* 512 B per page                       */
+#define N32_TOTAL_PAGES       128U           /* 128 pages = 64 KB                    */
+
+/* NV region: pages 120-127 (0x0800F000-0x0800FFFF) must not be erased/written */
+#define N32_NV_FIRST_PAGE    120U            /* First NV page (inclusive)            */
+#define N32_MAX_USER_PAGES   120U            /* Pages 0-119 are user-writable        */
 #define N32_MAX_BYTES        (N32_MAX_USER_PAGES * N32_PAGE_SIZE) /* 61440           */
 
 /* ============================================================================
@@ -98,6 +111,122 @@
 
 /* Known DP IDCODE for Cortex-M0 devices (returned by n32_flash_identify)    */
 #define CORTEX_M0_DP_IDCODE  0x0BB11477UL
+
+/* ============================================================================
+ * First verify mismatch seen during the last n32_flash_program() call.
+ * ========================================================================= */
+
+static uint32_t g_verify_addr     = 0;
+static uint32_t g_verify_expected = 0;
+static uint32_t g_verify_actual   = 0;
+
+uint32_t n32_flash_verify_addr(void) {
+    return g_verify_addr;
+}
+
+uint32_t n32_flash_verify_expected(void) {
+    return g_verify_expected;
+}
+
+uint32_t n32_flash_verify_actual(void) {
+    return g_verify_actual;
+}
+
+/* Flash controller state captured during programming, for diagnosis:
+ * CTRL read back right after PG is set, and STS after the first data write. */
+static uint32_t g_dbg_ctrl  = 0;
+static uint32_t g_dbg_sts   = 0;
+static uint8_t  g_dbg_first = 1;
+
+uint32_t n32_flash_dbg_ctrl(void) {
+    return g_dbg_ctrl;
+}
+
+uint32_t n32_flash_dbg_sts(void) {
+    return g_dbg_sts;
+}
+
+/* Flash protection state: OBR carries the read-protection level, WRPR the
+ * per-page write-protection mask (all ones = nothing protected).  With read
+ * protection active, debug reads of flash return 0xFFFFFFFF whatever is
+ * actually stored, so a protected part looks identical to an erased one. */
+static uint32_t g_dbg_obr  = 0;
+static uint32_t g_dbg_wrpr = 0;
+
+/* Where programming first failed, and the controller status at that moment. */
+static uint32_t g_fail_addr = 0;
+static uint32_t g_fail_sts  = 0;
+
+/* Erase-path state captured on the first page erase: CTRL and ADD read back
+ * after the start trigger, and STS sampled immediately afterwards.  If BSY
+ * never appears in STS the erase never began, which is indistinguishable from
+ * success to the polling loop. */
+static uint32_t g_er_ctrl  = 0;
+static uint32_t g_er_add   = 0;
+static uint32_t g_er_sts   = 0;
+static uint8_t  g_er_first = 1;
+
+/* Status read after the first page erase completes, before it is cleared. */
+static uint32_t g_er_done       = 0;
+static uint8_t  g_er_done_first = 1;
+
+/* The first word of the first page erased, sampled immediately before and
+ * immediately after the erase.  If these are equal the erase did not touch
+ * the address we asked it to, whatever the status register claims. */
+static uint32_t g_er_pre  = 0;
+static uint32_t g_er_post = 0;
+
+uint32_t n32_flash_er_pre(void) {
+    return g_er_pre;
+}
+
+uint32_t n32_flash_er_post(void) {
+    return g_er_post;
+}
+
+uint32_t n32_flash_er_done(void) {
+    return g_er_done;
+}
+
+uint32_t n32_flash_er_ctrl(void) {
+    return g_er_ctrl;
+}
+
+uint32_t n32_flash_er_add(void) {
+    return g_er_add;
+}
+
+uint32_t n32_flash_er_sts(void) {
+    return g_er_sts;
+}
+
+uint32_t n32_flash_fail_addr(void) {
+    return g_fail_addr;
+}
+
+uint32_t n32_flash_fail_sts(void) {
+    return g_fail_sts;
+}
+
+uint32_t n32_flash_dbg_obr(void) {
+    return g_dbg_obr;
+}
+
+uint32_t n32_flash_dbg_wrpr(void) {
+    return g_dbg_wrpr;
+}
+
+/* SRAM loopback results proving which MEM-AP transfer widths actually work. */
+static uint32_t g_dbg_ram16 = 0;
+static uint32_t g_dbg_ram32 = 0;
+
+uint32_t n32_flash_dbg_ram16(void) {
+    return g_dbg_ram16;
+}
+
+uint32_t n32_flash_dbg_ram32(void) {
+    return g_dbg_ram32;
+}
 
 /* ============================================================================
  * Internal helpers
@@ -141,32 +270,23 @@ static FlashResult flash_poll_bsy(uint32_t max_iters) {
     return FLASH_ERR_TIMEOUT;
 }
 
-/**
- * flash_check_errors() — inspect STS for PGERR / WRPERR after an operation.
- *
- * @param err_code   FlashResult to return if an error flag is set
- *                   (FLASH_ERR_ERASE or FLASH_ERR_PROGRAM).
- * @return FLASH_OK if no error flags, err_code or FLASH_ERR_PROTECTED on
- *         error, or FLASH_ERR_SWD if the register read fails.
- */
-static FlashResult flash_check_errors(FlashResult err_code) {
-    uint32_t sts = 0;
-    FlashResult r = flash_read32(N32_FLASH_STS, &sts);
-    if(r != FLASH_OK) return FLASH_ERR_SWD;
-
-    if(sts & N32_STS_WRPERR) return FLASH_ERR_PROTECTED;
-    if(sts & N32_STS_PGERR)  return err_code;
-    return FLASH_OK;
-}
+/* flash_check_errors() used to live here.  It read the status register only
+ * after flash_clear_status() had already wiped PGERR and WRPERR, so it could
+ * never see a failure.  Both the erase and program paths now sample the
+ * status themselves before clearing it. */
 
 /**
- * flash_clear_eop() — write 1 to N32_STS_EOP to acknowledge end-of-op.
+ * flash_clear_status() — acknowledge end-of-op and clear latched error flags.
  *
- * This is a write-1-to-clear bit; writing EOP does not disturb other bits
- * because PGERR/WRPERR are also write-1-to-clear and we write only EOP.
+ * EOP, PGERR and WRPERR are all write-1-to-clear.  Clearing only EOP (as this
+ * code used to) leaves PGERR set forever: the flags are sticky across
+ * operations and even across debug sessions, so one failed programming write
+ * makes every later erase and program report an error that already happened.
+ * Clearing all three keeps each operation's status check about that operation.
  */
-static FlashResult flash_clear_eop(void) {
-    return flash_write32(N32_FLASH_STS, N32_STS_EOP);
+static FlashResult flash_clear_status(void) {
+    return flash_write32(
+        N32_FLASH_STS, N32_STS_EOP | N32_STS_PGERR | N32_STS_WRPERR);
 }
 
 /**
@@ -231,6 +351,8 @@ static FlashResult flash_erase_page(uint32_t page_index) {
     FlashResult r;
     uint32_t page_addr = N32_FLASH_ORIGIN + (page_index * N32_PAGE_SIZE);
 
+    if(g_er_first) flash_read32(page_addr, &g_er_pre);
+
     /* Step 1: set PER mode */
     r = flash_write32(N32_FLASH_CTRL, N32_CTRL_PER);
     if(r != FLASH_OK) return r;
@@ -243,54 +365,102 @@ static FlashResult flash_erase_page(uint32_t page_index) {
     r = flash_write32(N32_FLASH_CTRL, N32_CTRL_PER | N32_CTRL_STRT);
     if(r != FLASH_OK) return r;
 
+    /* Snapshot the controller the instant after the trigger, once per pass. */
+    if(g_er_first) {
+        flash_read32(N32_FLASH_STS, &g_er_sts);
+        flash_read32(N32_FLASH_CTRL, &g_er_ctrl);
+        flash_read32(N32_FLASH_ADD, &g_er_add);
+        g_er_first = 0;
+    }
+
     /* Step 4: poll busy */
     r = flash_poll_bsy(POLL_MAX_ERASE);
     if(r != FLASH_OK) return r;  /* timeout or SWD error */
 
-    /* Step 5: clear EOP */
-    r = flash_clear_eop();
-    if(r != FLASH_OK) return r;
+    /* Step 5: read the status BEFORE clearing it.
+     *
+     * Clearing first (as this used to) wipes PGERR and WRPERR, so the check
+     * that follows always inspects a blank register and every failed erase
+     * looks like a success — which is exactly why the erase appeared to work
+     * while leaving pages full of data. */
+    uint32_t sts = 0;
+    if(!swd_ok(swd_read32(N32_FLASH_STS, &sts))) return FLASH_ERR_SWD;
 
-    /* Step 6: check error flags */
-    return flash_check_errors(FLASH_ERR_ERASE);
+    if(g_er_done_first) {
+        g_er_done       = sts;
+        g_er_done_first = 0;
+        flash_read32(page_addr, &g_er_post);
+    }
+
+    /* Step 6: acknowledge, then judge what we captured */
+    flash_clear_status();
+
+    if(sts & N32_STS_WRPERR) return FLASH_ERR_PROTECTED;
+    if(sts & N32_STS_PGERR) return FLASH_ERR_ERASE;
+    return FLASH_OK;
 }
 
 /**
- * flash_write_word() — program one 32-bit word at a flash address.
+ * flash_write_halfword() — program one 16-bit half-word at a flash address.
+ *
+ * HALF-WORD ONLY: the N32G031 flash controller is STM32F0-compatible IP and
+ * accepts only 16-bit programming writes.  A 32-bit write to a flash address
+ * while PG is set does not program — it sets PGERR.  Each 32-bit word of the
+ * image is therefore written as two half-words.
  *
  * Sequence per N32G031 reference manual:
  *   1. Set PG in CTRL.
- *   2. Write the word directly to the target flash address via SWD.
+ *   2. 16-bit write to the target flash address via SWD.
  *   3. Poll BSY.
  *   4. Clear EOP.
  *   5. Check PGERR / WRPERR.
  *
- * @param flash_addr  Target address in flash (must be 32-bit aligned).
- * @param word        Value to write.
+ * @param flash_addr  Target address in flash (must be 16-bit aligned).
+ * @param half        Half-word to write.
  * @return FLASH_OK, FLASH_ERR_PROGRAM, FLASH_ERR_PROTECTED, FLASH_ERR_SWD,
  *         or FLASH_ERR_TIMEOUT.
  */
 static FlashResult flash_write_word(uint32_t flash_addr, uint32_t word) {
-    FlashResult r;
+    /* PG is set once by the caller for the whole programming pass rather than
+     * per word, which keeps the transaction count (and the bus faults that
+     * came with it) down. */
+    if(!swd_ok(swd_write32(flash_addr, word))) return FLASH_ERR_SWD;
 
-    /* Step 1: set PG mode */
-    r = flash_write32(N32_FLASH_CTRL, N32_CTRL_PG);
-    if(r != FLASH_OK) return r;
+    /* Poll BSY (bit 0) in the status register. */
+    for(uint32_t i = 0; i < POLL_MAX_PROGRAM; i++) {
+        uint32_t sts = 0;
+        if(!swd_ok(swd_read32(N32_FLASH_STS, &sts))) return FLASH_ERR_SWD;
 
-    /* Step 2: write word directly to flash address */
-    r = flash_write32(flash_addr, word);
-    if(r != FLASH_OK) return r;
+        if(!(sts & N32_STS_BSY)) {
+            /* Snapshot the very first raw status, before the flags below are
+             * cleared — this is the only look we get at how the controller
+             * actually responded to a programming write. */
+            if(g_dbg_first) {
+                g_dbg_sts   = sts;
+                g_dbg_first = 0;
+            }
 
-    /* Step 3: poll busy */
-    r = flash_poll_bsy(POLL_MAX_PROGRAM);
-    if(r != FLASH_OK) return r;
+            /* Acknowledge EOP and clear any error flags (all write-1-to-clear
+             * and all in the low half-word). */
+            if(!swd_ok(swd_write32(
+                   N32_FLASH_STS,
+                   N32_STS_EOP | N32_STS_PGERR | N32_STS_WRPERR))) {
+                return FLASH_ERR_SWD;
+            }
 
-    /* Step 4: clear EOP */
-    r = flash_clear_eop();
-    if(r != FLASH_OK) return r;
+            if(sts & (N32_STS_WRPERR | N32_STS_PGERR)) {
+                g_fail_addr = flash_addr;
+                g_fail_sts  = sts;
+            }
+            if(sts & N32_STS_WRPERR) return FLASH_ERR_PROTECTED;
+            if(sts & N32_STS_PGERR) return FLASH_ERR_PROGRAM;
+            return FLASH_OK;
+        }
 
-    /* Step 5: check error flags */
-    return flash_check_errors(FLASH_ERR_PROGRAM);
+        furi_delay_us(POLL_DELAY_US);
+    }
+
+    return FLASH_ERR_TIMEOUT;
 }
 
 /* ============================================================================
@@ -345,8 +515,38 @@ FlashResult n32_flash_program(
     /* ------------------------------------------------------------------
      * Step 1: Unlock
      * ------------------------------------------------------------------ */
+    /* ------------------------------------------------------------------
+     * Transfer-width loopback test against SRAM.
+     *
+     * Flash programming needs 16-bit writes, but a flash write that does not
+     * take is indistinguishable from one the MEM-AP never issued.  SRAM has
+     * no controller in the way, so writing there and reading it back says
+     * plainly whether each transfer width works.  The core is halted and the
+     * application firmware is about to be erased, so scribbling here is safe.
+     *
+     * Expect ram16 == 0x5A5AA5A5 and ram32 == 0xDEADBEEF.
+     * ------------------------------------------------------------------ */
+    /* Protection state, read before anything else touches the controller. */
+    flash_read32(N32_FLASH_OBR, &g_dbg_obr);
+    flash_read32(N32_FLASH_WRPR, &g_dbg_wrpr);
+    g_dbg_first     = 1;
+    g_er_first      = 1;
+    g_er_done_first = 1;
+
+    swd_write16(0x20000100UL, 0xA5A5U);
+    swd_write16(0x20000102UL, 0x5A5AU);
+    flash_read32(0x20000100UL, &g_dbg_ram16);
+
+    flash_write32(0x20000104UL, 0xDEADBEEFUL);
+    flash_read32(0x20000104UL, &g_dbg_ram32);
+
     r = flash_unlock();
     if(r != FLASH_OK) return r;  /* Never locked yet — no lock cleanup needed */
+
+    /* Wipe status flags left over from any earlier attempt.  They are sticky,
+     * so a previous run's PGERR would otherwise be reported against our first
+     * erase — an error from a completely different session. */
+    flash_clear_status();
 
     /* ------------------------------------------------------------------
      * Step 2: Page erase (pages 0 .. pages_needed-1)
@@ -365,10 +565,74 @@ FlashResult n32_flash_program(
     }
 
     /* ------------------------------------------------------------------
+     * Step 2b: Confirm the erase actually blanked every page, and re-erase
+     * any that did not.
+     *
+     * flash_erase_page() reporting success is not proof: a page can come back
+     * still holding data with no error flag set, and programming into it then
+     * fails with PGERR partway through the image (observed on the last page).
+     * Erase is all-or-nothing per page, so a sparse scan is enough to spot a
+     * page that did not take, and is far cheaper than reading every word.
+     * ------------------------------------------------------------------ */
+    for(uint32_t page = 0; page < pages_needed; page++) {
+        uint32_t page_addr = N32_FLASH_ORIGIN + (page * N32_PAGE_SIZE);
+
+        for(uint32_t attempt = 0;; attempt++) {
+            bool blank = true;
+
+            for(uint32_t off = 0; off < N32_PAGE_SIZE; off += 64U) {
+                uint32_t v = 0;
+                if(flash_read32(page_addr + off, &v) != FLASH_OK) {
+                    flash_lock();
+                    return FLASH_ERR_SWD;
+                }
+                if(v != 0xFFFFFFFFUL) {
+                    /* Record exactly where the erase stopped reaching: the
+                     * offset of the first surviving word reveals the real
+                     * erase granularity. */
+                    g_fail_addr = page_addr + off;
+                    g_fail_sts  = v;
+                    blank       = false;
+                    break;
+                }
+            }
+
+            if(blank) break;
+
+            if(attempt >= 2U) {
+                /* Three erases and it still holds data.  g_fail_addr already
+                 * points at the first word that survived. */
+                flash_lock();
+                return FLASH_ERR_ERASE;
+            }
+
+            r = flash_erase_page(page);
+            if(r != FLASH_OK) {
+                flash_lock();
+                return r;
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------
      * Step 3: Program words
      * ------------------------------------------------------------------ */
     uint32_t progress_cb_threshold = N32_PAGE_SIZE; /* report every 1 KB */
     uint32_t bytes_since_last_cb   = 0;
+
+    /* Set PG once for the entire programming pass.  The bit stays set until
+     * we clear it after the loop, so the inner loop never has to touch CTRL
+     * (and never has to leave 16-bit transfer mode). */
+    r = flash_write32(N32_FLASH_CTRL, N32_CTRL_PG);
+    if(r != FLASH_OK) {
+        flash_lock();
+        return r;
+    }
+
+    /* Read CTRL back: if PG is not actually set here, the data writes below
+     * will be quietly swallowed by the flash controller — no BSY, no error
+     * flag, and a blank flash at verify time. */
+    flash_read32(N32_FLASH_CTRL, &g_dbg_ctrl);
 
     for(uint32_t i = 0; i < words_to_write; i++) {
         /* Build the 32-bit word from the source buffer.
@@ -382,12 +646,17 @@ FlashResult n32_flash_program(
         memcpy(&word, data + byte_offset, copy_bytes);
         /* Any remaining bytes in 'word' are already 0 (zero-initialised) */
 
+        /* 32-bit word programming.  Half-word writes were tried first (the
+         * flash IP looked STM32F0-like) but the controller ignores them
+         * outright: no BSY, no EOP, no error, flash left blank.  Word writes
+         * do reach it. */
         uint32_t flash_addr = N32_FLASH_ORIGIN + byte_offset;
         r = flash_write_word(flash_addr, word);
         if(r != FLASH_OK) {
             flash_lock();  /* best-effort */
             return r;
         }
+
 
         bytes_since_last_cb += 4U;
         if(bytes_since_last_cb >= progress_cb_threshold) {
@@ -430,6 +699,13 @@ FlashResult n32_flash_program(
         }
 
         if(actual != expected) {
+            /* Capture the first mismatch so the UI can show what actually came
+             * back — 0xFFFFFFFF means nothing was programmed there, a shifted
+             * or byte-swapped value means a lane/ordering bug, and a partial
+             * match means the erase did not take. */
+            g_verify_addr     = flash_addr;
+            g_verify_expected = expected;
+            g_verify_actual   = actual;
             flash_lock();
             return FLASH_ERR_VERIFY;
         }

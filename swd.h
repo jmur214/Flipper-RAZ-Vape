@@ -29,7 +29,10 @@ extern "C" {
 #include <furi_hal.h>
 
 #define SWD_SWDIO (&gpio_ext_pa7)
-#define SWD_SWCLK (&gpio_ext_pa6)
+/* SWCLK moved off PA6 (header pin 3) → PC3 (header pin 7): the A6 contact
+ * proved dead on this Flipper (line probed FLOAT through both jumper wires
+ * and both breakout pads). */
+#define SWD_SWCLK (&gpio_ext_pc3)
 
 /* ---------------------------------------------------------------------------
  * Return / status codes
@@ -99,6 +102,34 @@ SWDAck swd_read32(uint32_t addr, uint32_t* out);
 SWDAck swd_write32(uint32_t addr, uint32_t val);
 
 /**
+ * swd_write16() — write one 16-bit half-word to the target's memory map.
+ *
+ * Switches the MEM-AP to 16-bit transfers and places the half-word in the
+ * DRW byte lane selected by address bit 1, as the MEM-AP requires.
+ *
+ * Needed for flash programming: the N32G031 flash controller is STM32F0
+ * compatible and accepts ONLY half-word programming writes.  A 32-bit write
+ * to a flash address in PG mode sets PGERR instead of programming.
+ *
+ * @param addr   Target byte address (must be 16-bit aligned).
+ * @param val    Half-word to write.
+ * @return       SWD_ACK_OK on success, or an ACK/error code on failure.
+ */
+SWDAck swd_write16(uint32_t addr, uint16_t val);
+
+/**
+ * swd_read16() — read one 16-bit half-word from the target's memory map.
+ *
+ * Lets the flash programming loop poll the status register without switching
+ * the MEM-AP back to 32-bit between every half-word written.
+ *
+ * @param addr   Target byte address (must be 16-bit aligned).
+ * @param out    Receives the half-word read from the target.
+ * @return       SWD_ACK_OK on success, or an ACK/error code on failure.
+ */
+SWDAck swd_read16(uint32_t addr, uint16_t* out);
+
+/**
  * swd_halt() — halt the Cortex-M0 core via DHCSR.
  *
  * Writes 0xA05F0003 (DBGKEY | C_HALT | C_DEBUGEN) to 0xE000EDF0.
@@ -106,6 +137,70 @@ SWDAck swd_write32(uint32_t addr, uint32_t val);
  * @return SWD_ACK_OK on success, or an ACK/error code on failure.
  */
 SWDAck swd_halt(void);
+
+/**
+ * swd_probe() — passive electrical probe of both SWD lines.
+ *
+ * For each line, reads the pin under an internal pull-down and then an
+ * internal pull-up (2-bit result: bit0 = level under pull-down, bit1 =
+ * level under pull-up):
+ *   0b10 (2) — follows our pulls  → line FLOATING (no electrical path)
+ *   0b11 (3) — high both times    → externally pulled/driven HIGH (connected)
+ *   0b00 (0) — low both times     → externally pulled/driven LOW  (connected)
+ *   0b01 (1) — inverted           → oscillating / being actively driven
+ *
+ * Leaves both pins as no-pull inputs. Purely passive — never drives the
+ * lines, safe to call at any time.
+ */
+void swd_probe(uint8_t* swdio_state, uint8_t* swclk_state);
+
+/**
+ * Diagnostics describing the most recent swd_connect() attempt.
+ *
+ * swd_last_stage() returns the step that was in progress when the connect
+ * gave up (0 = completed successfully):
+ *   1 = reading DP IDCODE
+ *   2 = DP SELECT write
+ *   3 = CTRL/STAT power-up request write
+ *   4 = polling for the power-up acknowledge
+ *   5 = MEM-AP CSW write
+ *
+ * swd_last_idcode() returns the raw IDCODE if one was read (0 if never).
+ * A plausible IDCODE with bit 0 set proves the wire protocol is working.
+ *
+ * swd_last_stat() returns the last CTRL/STAT value seen while polling for the
+ * power-up acknowledge — bit 31 is CSYSPWRUPACK, bit 29 is CDBGPWRUPACK.
+ */
+uint8_t  swd_last_stage(void);
+uint32_t swd_last_idcode(void);
+uint32_t swd_last_stat(void);
+
+/**
+ * swd_last_trn() — the write-data turnaround length swd_connect() settled on
+ * while calibrating the write frame (0-3 clocks).
+ */
+uint8_t  swd_last_trn(void);
+
+/**
+ * swd_last_ack_err() — the most recent non-OK ACK returned by any SWD
+ * transaction.  Useful for telling apart the causes of a flash-time
+ * "SWD communication error": 4 = FAULT, 2 = WAIT (retries exhausted),
+ * 7 = line floating, 0 = line stuck low.
+ */
+SWDAck swd_last_ack_err(void);
+
+/**
+ * swd_raw_capture() — alignment diagnostic.
+ *
+ * Performs a line reset + JTAG-to-SWD switch, sends the DP IDCODE read
+ * request, then clocks in 64 raw bits making NO assumption about where the
+ * turnaround ends or where the ACK begins.  Bit 0 of *first32 is the first
+ * bit clocked in after the request byte.
+ *
+ * This makes the real framing visible: find the first 1 (the target starting
+ * to drive ACK[0]) and the 32 bits of IDCODE that follow it.
+ */
+void swd_raw_capture(uint32_t* first32, uint32_t* second32);
 
 /**
  * swd_reset_and_run() — trigger a system reset and release halt.

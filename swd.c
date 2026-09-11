@@ -43,6 +43,26 @@
 #define SWD_HALF_PERIOD_US (10U)
 
 /* ---------------------------------------------------------------------------
+ * Frame alignment — NO leading turnaround clock
+ *
+ * The ARM spec describes a turnaround period between the host's 8-bit request
+ * and the target's 3-bit ACK.  On this target (N32G031 reached over the USB-C
+ * CC lines) that turnaround is absorbed: the target is already driving ACK[0]
+ * on the first clock after the request byte.
+ *
+ * Verified by capturing 64 raw bits immediately after an IDCODE request:
+ *   bits 0..2   = 1,0,0        -> ACK = OK
+ *   bits 3..34  = 0x0BB11477   -> Cortex-M0 DP IDCODE
+ *   bit  35     = 1            -> correct even parity for that IDCODE
+ *
+ * Clocking an extra turnaround cycle first swallows ACK[0] and shifts the ACK
+ * to 0,0,1, which decodes as FAULT — making every connect fail against a
+ * target that was in fact responding perfectly.  So the ACK is read directly
+ * after releasing SWDIO, with no turnaround clock.  The TRAILING turnaround
+ * (host taking the line back) is still required and is kept.
+ * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
  * DP register addresses  (A[3:2] field of the 8-bit request byte)
  * The address encodes bits [3:2] only; bit 1 and bit 0 are always 0.
  * We pass the full byte-address and extract A[3:2] in swd_build_request().
@@ -70,9 +90,50 @@
 #define AIRCR_RESET_VAL (0x05FA0004UL) /* VECTKEY | SYSRESETREQ       */
 
 /* ---------------------------------------------------------------------------
+ * ABORT register: clear all sticky error flags.
+ * STKCMPCLR | STKERRCLR | WDERRCLR | ORUNERRCLR = 0x1E.
+ *
+ * A DP that has latched a sticky error answers subsequent transactions with
+ * FAULT (ACK=0x04) until these are cleared.  This is the usual reason a
+ * connect fails on a target that is wired correctly and clearly responding.
+ * ------------------------------------------------------------------------- */
+#define DP_ABORT_CLEAR_ALL (0x0000001EUL)
+
+/* ---------------------------------------------------------------------------
  * Power-up polling limit
  * ------------------------------------------------------------------------- */
 #define PWRUP_POLL_LIMIT (1000U)
+
+/* ---------------------------------------------------------------------------
+ * Diagnostics for the last swd_connect() attempt — see swd.h.
+ * ------------------------------------------------------------------------- */
+static uint8_t  g_last_stage  = 0;
+static uint32_t g_last_idcode = 0;
+static uint32_t g_last_stat   = 0;
+
+/* Turnaround clocks inserted between the target's ACK and the host's write
+ * data.  Reads need none before the ACK (see the frame-alignment note), but
+ * the write data phase is a separate turnaround whose length this target does
+ * not follow the spec on.  swd_connect() calibrates it empirically. */
+static uint8_t  g_write_trn   = 1;
+static uint8_t  g_last_trn    = 1;
+
+/* MEM-AP CSW.
+ *
+ * Prot[30:24] carries HPROT onto the bus, and it matters: HPROT[0] (bit 24)
+ * selects data access (1) versus opcode fetch (0), and HPROT[1] (bit 25)
+ * selects privileged.  Leaving Prot at zero presents every write as an
+ * unprivileged instruction fetch — SRAM does not care, but the flash
+ * controller ignores it as a programming write, so the flash silently stays
+ * erased.  0x23000000 is the value debuggers conventionally use here.
+ *
+ * Low bits are Size[2:0], with AddrInc left off. */
+#define CSW_PROT    (0x23000000UL)
+#define CSW_SIZE_32 (CSW_PROT | 0x00000002UL)
+#define CSW_SIZE_16 (CSW_PROT | 0x00000001UL)
+
+/* Cached CSW size so the width is only reprogrammed when it actually changes. */
+static uint32_t g_csw_size = CSW_SIZE_32;
 
 /* ===========================================================================
  * Low-level bit-bang helpers
@@ -260,16 +321,16 @@ static uint8_t swd_build_request(bool apndp, bool rnw, uint8_t addr) {
  * @param out   Receives the 32-bit register value on SWD_ACK_OK
  * @return      ACK code
  */
-static SWDAck swd_dp_read(uint8_t addr, uint32_t* out) {
+static SWDAck swd_dp_read_once(uint8_t addr, uint32_t* out) {
     uint8_t req = swd_build_request(false, true, addr);
 
     /* Phase 1: send request (host drives SWDIO) */
     dio_output();
     swd_write_bits(req, 8);
 
-    /* Phase 2: turnaround — release SWDIO, clock 1 cycle */
+    /* Phase 2: release SWDIO.  No turnaround clock — see the frame-alignment
+     * note at the top of this file: ACK[0] is already on the wire. */
     dio_input();
-    swd_turnaround();
 
     /* Phase 3: read 3-bit ACK (target drives) */
     uint32_t ack = 0;
@@ -320,25 +381,28 @@ static SWDAck swd_dp_read(uint8_t addr, uint32_t* out) {
  * @param val   32-bit value to write
  * @return      ACK code
  */
-static SWDAck swd_dp_write(uint8_t addr, uint32_t val) {
+static SWDAck swd_dp_write_once(uint8_t addr, uint32_t val) {
     uint8_t req = swd_build_request(false, false, addr);
 
     /* Phase 1: send request (host drives SWDIO) */
     dio_output();
     swd_write_bits(req, 8);
 
-    /* Phase 2: turnaround — release SWDIO, clock 1 cycle */
+    /* Phase 2: release SWDIO.  No turnaround clock — see the frame-alignment
+     * note at the top of this file: ACK[0] is already on the wire. */
     dio_input();
-    swd_turnaround();
 
     /* Phase 3: read 3-bit ACK */
     uint32_t ack = 0;
     swd_read_bits(&ack, 3);
 
     if(ack == (uint32_t)SWD_ACK_OK) {
-        /* Phase 4: turnaround — host takes SWDIO back, clock 1 cycle */
+        /* Phase 4: host takes SWDIO back, then g_write_trn turnaround clocks
+         * before driving data.  The correct count is target-specific and is
+         * calibrated by swd_connect(); get it wrong and every data bit plus
+         * the parity shifts, so the DP silently discards the write. */
         dio_output();
-        swd_turnaround();
+        for(uint8_t t = 0; t < g_write_trn; t++) swd_turnaround();
 
         /* Phase 5: write 32-bit data + parity */
         swd_write_bits(val, 32);
@@ -370,16 +434,15 @@ static SWDAck swd_dp_write(uint8_t addr, uint32_t val) {
  * @param out   Receives the (pipelined) 32-bit value on SWD_ACK_OK
  * @return      ACK code
  */
-static SWDAck swd_ap_read(uint8_t addr, uint32_t* out) {
+static SWDAck swd_ap_read_once(uint8_t addr, uint32_t* out) {
     uint8_t req = swd_build_request(true, true, addr);
 
     /* Phase 1: send request */
     dio_output();
     swd_write_bits(req, 8);
 
-    /* Phase 2: turnaround */
+    /* Phase 2: release SWDIO (no turnaround clock — see alignment note). */
     dio_input();
-    swd_turnaround();
 
     /* Phase 3: 3-bit ACK */
     uint32_t ack = 0;
@@ -424,25 +487,24 @@ static SWDAck swd_ap_read(uint8_t addr, uint32_t* out) {
  * @param val   32-bit value to write
  * @return      ACK code
  */
-static SWDAck swd_ap_write(uint8_t addr, uint32_t val) {
+static SWDAck swd_ap_write_once(uint8_t addr, uint32_t val) {
     uint8_t req = swd_build_request(true, false, addr);
 
     /* Phase 1: send request */
     dio_output();
     swd_write_bits(req, 8);
 
-    /* Phase 2: turnaround */
+    /* Phase 2: release SWDIO (no turnaround clock — see alignment note). */
     dio_input();
-    swd_turnaround();
 
     /* Phase 3: 3-bit ACK */
     uint32_t ack = 0;
     swd_read_bits(&ack, 3);
 
     if(ack == (uint32_t)SWD_ACK_OK) {
-        /* Phase 4: turnaround */
+        /* Phase 4: host takes SWDIO back + calibrated turnaround (see note). */
         dio_output();
-        swd_turnaround();
+        for(uint8_t t = 0; t < g_write_trn; t++) swd_turnaround();
 
         /* Phase 5: 32-bit data + parity */
         swd_write_bits(val, 32);
@@ -458,6 +520,118 @@ static SWDAck swd_ap_write(uint8_t addr, uint32_t val) {
         swd_write_bit(false);
         return (SWDAck)ack;
     }
+}
+
+/* ===========================================================================
+ * WAIT retry wrappers
+ *
+ * A target answers WAIT whenever it cannot accept a transaction yet — which
+ * during flash erase/program is most of the time, and became far more likely
+ * once each word turned into two half-word writes plus CSW width switches.
+ * WAIT is not an error: the transaction simply has to be repeated.  Treating
+ * it as fatal (as this driver used to) surfaces as a spurious "SWD
+ * communication error" partway through an otherwise healthy flash.
+ * ======================================================================== */
+
+#define SWD_WAIT_RETRIES  (200U)
+#define SWD_FAULT_RETRIES (4U)
+
+/* Last non-OK ACK seen, for diagnostics on the error screen. */
+static SWDAck g_last_ack_err = SWD_ACK_OK;
+
+SWDAck swd_last_ack_err(void) {
+    return g_last_ack_err;
+}
+
+/* Clear the DP's sticky error flags.  Deliberately uses the _once form: the
+ * retry wrappers below call this from inside their own loops.
+ *
+ * A FAULT is latched, not transient — once a sticky error is set the DP
+ * answers FAULT to everything until ABORT clears it.  During flash work an
+ * occasional error is normal, so recovering and retrying is the difference
+ * between a flash that completes and one that dies partway through. */
+static void swd_clear_sticky(void) {
+    swd_dp_write_once(DP_REG_ABORT, DP_ABORT_CLEAR_ALL);
+}
+
+static SWDAck swd_dp_read(uint8_t addr, uint32_t* out) {
+    SWDAck   r      = SWD_ACK_WAIT;
+    uint32_t faults = 0;
+    for(uint32_t i = 0; i < SWD_WAIT_RETRIES; i++) {
+        r = swd_dp_read_once(addr, out);
+        if(r == SWD_ACK_WAIT) {
+            furi_delay_us(10);
+            continue;
+        }
+        if(r == SWD_ACK_FAULT && faults++ < SWD_FAULT_RETRIES) {
+            swd_clear_sticky();
+            furi_delay_us(10);
+            continue;
+        }
+        break;
+    }
+    if(r != SWD_ACK_OK) g_last_ack_err = r;
+    return r;
+}
+
+static SWDAck swd_dp_write(uint8_t addr, uint32_t val) {
+    SWDAck   r      = SWD_ACK_WAIT;
+    uint32_t faults = 0;
+    for(uint32_t i = 0; i < SWD_WAIT_RETRIES; i++) {
+        r = swd_dp_write_once(addr, val);
+        if(r == SWD_ACK_WAIT) {
+            furi_delay_us(10);
+            continue;
+        }
+        if(r == SWD_ACK_FAULT && faults++ < SWD_FAULT_RETRIES) {
+            swd_clear_sticky();
+            furi_delay_us(10);
+            continue;
+        }
+        break;
+    }
+    if(r != SWD_ACK_OK) g_last_ack_err = r;
+    return r;
+}
+
+static SWDAck swd_ap_read(uint8_t addr, uint32_t* out) {
+    SWDAck   r      = SWD_ACK_WAIT;
+    uint32_t faults = 0;
+    for(uint32_t i = 0; i < SWD_WAIT_RETRIES; i++) {
+        r = swd_ap_read_once(addr, out);
+        if(r == SWD_ACK_WAIT) {
+            furi_delay_us(10);
+            continue;
+        }
+        if(r == SWD_ACK_FAULT && faults++ < SWD_FAULT_RETRIES) {
+            swd_clear_sticky();
+            furi_delay_us(10);
+            continue;
+        }
+        break;
+    }
+    if(r != SWD_ACK_OK) g_last_ack_err = r;
+    return r;
+}
+
+static SWDAck swd_ap_write(uint8_t addr, uint32_t val) {
+    SWDAck   r      = SWD_ACK_WAIT;
+    uint32_t faults = 0;
+    for(uint32_t i = 0; i < SWD_WAIT_RETRIES; i++) {
+        r = swd_ap_write_once(addr, val);
+        if(r == SWD_ACK_WAIT) {
+            furi_delay_us(10);
+            continue;
+        }
+        if(r == SWD_ACK_FAULT && faults++ < SWD_FAULT_RETRIES) {
+            swd_clear_sticky();
+            furi_delay_us(10);
+            continue;
+        }
+        break;
+    }
+    if(r != SWD_ACK_OK) g_last_ack_err = r;
+    return r;
 }
 
 /* ===========================================================================
@@ -509,6 +683,67 @@ static void swd_idle_cycles(uint8_t n) {
  * Public API implementation
  * ======================================================================== */
 
+void swd_raw_capture(uint32_t* first32, uint32_t* second32) {
+    furi_hal_gpio_init(SWD_SWCLK, GpioModeOutputPushPull, GpioPullNo, GpioSpeedVeryHigh);
+    furi_hal_gpio_write(SWD_SWCLK, false);
+
+    swd_line_reset();
+    swd_jtag_to_swd();
+    swd_line_reset();
+    swd_idle_cycles(8);
+
+    /* DP IDCODE read request (0xA5) */
+    dio_output();
+    swd_write_bits(swd_build_request(false, true, DP_REG_IDCODE), 8);
+
+    /* Release the line and clock in raw bits — no turnaround assumed. */
+    dio_input();
+    swd_read_bits(first32, 32);
+    swd_read_bits(second32, 32);
+}
+
+/**
+ * swd_resync() — line reset + JTAG-to-SWD, then confirm the DP by reading
+ * IDCODE.  Used both to establish the link and to recover between write-frame
+ * calibration attempts, since a mis-framed write leaves the DP out of step.
+ */
+static SWDAck swd_resync(void) {
+    SWDAck result = SWD_ERR_NO_TARGET;
+
+    for(int attempt = 0; attempt < 4; attempt++) {
+        swd_line_reset();
+
+        /* Odd attempts add the JTAG-to-SWD switch, in case the debug port
+         * came up in JTAG mode; the N32G031 is SWD-only so even attempts
+         * skip it. */
+        if(attempt & 1) {
+            swd_jtag_to_swd();
+            swd_line_reset();
+        }
+
+        swd_idle_cycles(8);
+
+        uint32_t idcode = 0;
+        result = swd_dp_read(DP_REG_IDCODE, &idcode);
+        if(result != SWD_ACK_OK) {
+            swd_dp_write(DP_REG_ABORT, DP_ABORT_CLEAR_ALL);
+            continue;
+        }
+
+        g_last_idcode = idcode;
+
+        /* Bit 0 of a valid IDCODE is always 1 per the ARM spec. */
+        if((idcode & 1U) == 0) {
+            result = SWD_ERR_NO_TARGET;
+            continue;
+        }
+
+        return SWD_ACK_OK;
+    }
+
+    return result;
+}
+
 SWDAck swd_connect(void) {
     /* Initialise both pins at very-high speed; CLK starts low, SWDIO high. */
     furi_hal_gpio_init(SWD_SWCLK, GpioModeOutputPushPull, GpioPullNo, GpioSpeedVeryHigh);
@@ -518,85 +753,112 @@ SWDAck swd_connect(void) {
 
     SWDAck result = SWD_ERR_NO_TARGET;
 
-    /*
-     * Try 4 attempts, alternating between two connection sequences:
-     *
-     *   Even attempts (0, 2): pure SWD line reset only.
-     *     The N32G031 is SWD-only (no JTAG mux) and may come up in SWD mode
-     *     already, making the JTAG-to-SWD switch unnecessary or harmful.
-     *
-     *   Odd attempts (1, 3): full JTAG-to-SWD switch sequence.
-     *     Required if the debug port happens to be in JTAG mode.
-     *
-     * On failure we preserve the real ACK from swd_dp_read (rather than
-     * forcing SWD_ERR_NO_TARGET) so the caller can show a diagnostic code:
-     *   1 = OK (shouldn't reach here)
-     *   2 = WAIT  — target busy
-     *   4 = FAULT — target flagged error (stuck overrun?)
-     *   7 = all-ones → SWDIO still floating / no target driving the bus
-     *   0 = all-zeros → SWDIO stuck low (short / wrong pin)
-     */
-    for(int attempt = 0; attempt < 4; attempt++) {
-        /* Always start with a line reset to put the DP in reset state. */
-        swd_line_reset();
+    g_last_stage  = 1; /* reading IDCODE */
+    g_last_idcode = 0;
 
-        if(attempt & 1) {
-            /* Odd attempt: send JTAG-to-SWD switch, then another line reset. */
-            swd_jtag_to_swd();
-            swd_line_reset();
-        }
-
-        /* 8 idle clocks LOW — gives the DP time to settle. */
-        swd_idle_cycles(8);
-
-        /* Read DP IDCODE. */
-        uint32_t idcode = 0;
-        result = swd_dp_read(DP_REG_IDCODE, &idcode);
-        if(result != SWD_ACK_OK) {
-            /* Preserve the real ACK for diagnostics and retry. */
-            continue;
-        }
-
-        /* Validate: bit 0 of IDCODE must be 1 per ARM spec. */
-        if((idcode & 1U) == 0) {
-            /* Got OK ACK but garbage data — treat as no target. */
-            result = SWD_ERR_NO_TARGET;
-            continue;
-        }
-
-        /* Valid IDCODE — proceed with power-up. */
-        result = SWD_ACK_OK;
-        break;
-    }
-
+    result = swd_resync();
     if(result != SWD_ACK_OK) {
-        /* Return the real last ACK so the UI can show a useful code. */
+        /* Return the real last ACK so the UI can show a useful code:
+         *   2 = WAIT  — target busy
+         *   4 = FAULT — target flagged an error
+         *   7 = all-ones → SWDIO floating / nothing driving the bus
+         *   0 = all-zeros → SWDIO stuck low (short / wrong pin) */
         return result;
     }
 
-    /* Step 6: Request system power-up and debug power-up */
-    /* CSYSPWRUPREQ (bit 30) | CDBGPWRUPREQ (bit 28) = 0x50000000 */
-    result = swd_dp_write(DP_REG_CTRLSTAT, 0x50000000UL);
-    if(result != SWD_ACK_OK) return result;
+    /*
+     * Calibrate the write frame.
+     *
+     * Reads are known-good at this point, but writes were being ACKed while
+     * their data never landed — CTRL/STAT read back as zero no matter what we
+     * wrote.  The unknown is how many turnaround clocks this target wants
+     * between its ACK and the host's data, and guessing it one rebuild at a
+     * time is hopeless, so try each candidate and keep whichever one sticks.
+     *
+     * The test is self-verifying: write CTRL/STAT, then read it back.  If the
+     * power-up acknowledge appears, the data phase reached the DP intact.
+     * Every attempt restarts from a line reset, because a mis-framed write
+     * leaves the DP's state machine out of step with us.
+     */
+    g_last_stage = 2;
 
-    /* Step 7: Poll until CSYSPWRUPACK (bit 31) and CDBGPWRUPACK (bit 29) */
-    uint32_t stat = 0;
-    for(uint32_t i = 0; i < PWRUP_POLL_LIMIT; i++) {
-        result = swd_dp_read(DP_REG_CTRLSTAT, &stat);
-        if(result != SWD_ACK_OK) return result;
-        if((stat & 0xA0000000UL) == 0xA0000000UL) break;
-        furi_delay_us(100);
-        if(i == PWRUP_POLL_LIMIT - 1) return SWD_ERR_TIMEOUT;
+    uint32_t stat    = 0;
+    bool     powered = false;
+
+    for(uint8_t trn = 0; trn <= 3 && !powered; trn++) {
+        g_write_trn = trn;
+
+        if(swd_resync() != SWD_ACK_OK) continue;
+
+        swd_dp_write(DP_REG_ABORT, DP_ABORT_CLEAR_ALL);
+
+        /* SELECT must be written before CTRL/STAT: DPBANKSEL decides which
+         * register is visible at DP address 0x04, and SELECT survives a line
+         * reset, so a stale bank would send the reads below elsewhere. */
+        if(swd_dp_write(DP_REG_SELECT, 0x00000000UL) != SWD_ACK_OK) continue;
+
+        /* CSYSPWRUPREQ (bit 30) | CDBGPWRUPREQ (bit 28) */
+        if(swd_dp_write(DP_REG_CTRLSTAT, 0x50000000UL) != SWD_ACK_OK) continue;
+
+        for(uint32_t i = 0; i < 100U; i++) {
+            if(swd_dp_read(DP_REG_CTRLSTAT, &stat) != SWD_ACK_OK) break;
+            g_last_stat = stat;
+            /* CDBGPWRUPACK (bit 29) is the one that matters — not every part
+             * implements the system power domain and asserts bit 31. */
+            if(stat & 0x20000000UL) {
+                powered = true;
+                break;
+            }
+            furi_delay_us(100);
+        }
     }
 
-    /* Step 8: Select AP 0, bank 0 */
-    result = swd_dp_write(DP_REG_SELECT, 0x00000000UL);
-    if(result != SWD_ACK_OK) return result;
+    g_last_trn = g_write_trn;
+    if(!powered) return SWD_ERR_TIMEOUT;
+
+    g_last_stage = 5; /* MEM-AP CSW */
 
     /* Step 9: Configure MEM-AP CSW for 32-bit word transfers, AddrInc off */
     /* Size[2:0]=010 (32-bit), AddrInc[5:4]=00 (off) = 0x00000002        */
-    result = swd_ap_write(AP_REG_CSW, 0x00000002UL);
+    result = swd_ap_write(AP_REG_CSW, CSW_SIZE_32);
+    if(result == SWD_ACK_OK) {
+        g_csw_size   = CSW_SIZE_32;
+        g_last_stage = 0; /* completed */
+    }
     return result;
+}
+
+static uint8_t probe_line(const GpioPin* pin) {
+    uint8_t r = 0;
+    furi_hal_gpio_init(pin, GpioModeInput, GpioPullDown, GpioSpeedLow);
+    furi_delay_us(200);
+    if(furi_hal_gpio_read(pin)) r |= 1;
+    furi_hal_gpio_init(pin, GpioModeInput, GpioPullUp, GpioSpeedLow);
+    furi_delay_us(200);
+    if(furi_hal_gpio_read(pin)) r |= 2;
+    furi_hal_gpio_init(pin, GpioModeInput, GpioPullNo, GpioSpeedLow);
+    return r;
+}
+
+void swd_probe(uint8_t* swdio_state, uint8_t* swclk_state) {
+    *swdio_state = probe_line(SWD_SWDIO);
+    *swclk_state = probe_line(SWD_SWCLK);
+}
+
+uint8_t swd_last_stage(void) {
+    return g_last_stage;
+}
+
+uint32_t swd_last_idcode(void) {
+    return g_last_idcode;
+}
+
+uint32_t swd_last_stat(void) {
+    return g_last_stat;
+}
+
+uint8_t swd_last_trn(void) {
+    return g_last_trn;
 }
 
 void swd_disconnect(void) {
@@ -605,8 +867,49 @@ void swd_disconnect(void) {
     furi_hal_gpio_init(SWD_SWCLK, GpioModeInput, GpioPullNo, GpioSpeedLow);
 }
 
+static SWDAck swd_set_csw(uint32_t size) {
+    if(g_csw_size == size) return SWD_ACK_OK;
+    SWDAck r = swd_ap_write(AP_REG_CSW, size);
+    if(r == SWD_ACK_OK) g_csw_size = size;
+    return r;
+}
+
+SWDAck swd_write16(uint32_t addr, uint16_t val) {
+    SWDAck result = swd_set_csw(CSW_SIZE_16);
+    if(result != SWD_ACK_OK) return result;
+
+    result = swd_ap_write(AP_REG_TAR, addr);
+    if(result != SWD_ACK_OK) return result;
+
+    /* On a 16-bit transfer the MEM-AP takes the half-word from the DRW byte
+     * lane picked out by address bit 1. */
+    uint32_t data = (addr & 2U) ? ((uint32_t)val << 16) : (uint32_t)val;
+    return swd_ap_write(AP_REG_DRW, data);
+}
+
+SWDAck swd_read16(uint32_t addr, uint16_t* out) {
+    SWDAck result = swd_set_csw(CSW_SIZE_16);
+    if(result != SWD_ACK_OK) return result;
+
+    result = swd_ap_write(AP_REG_TAR, addr);
+    if(result != SWD_ACK_OK) return result;
+
+    /* AP reads are pipelined — the real data comes back via DP RDBUFF. */
+    uint32_t discard = 0;
+    result = swd_ap_read(AP_REG_DRW, &discard);
+    if(result != SWD_ACK_OK) return result;
+
+    uint32_t data = 0;
+    result = swd_dp_read(DP_REG_RDBUFF, &data);
+    if(result != SWD_ACK_OK) return result;
+
+    *out = (uint16_t)((addr & 2U) ? (data >> 16) : data);
+    return SWD_ACK_OK;
+}
+
 SWDAck swd_read32(uint32_t addr, uint32_t* out) {
-    SWDAck result;
+    SWDAck result = swd_set_csw(CSW_SIZE_32);
+    if(result != SWD_ACK_OK) return result;
 
     /* Write TAR with the target address */
     result = swd_ap_write(AP_REG_TAR, addr);
@@ -626,7 +929,8 @@ SWDAck swd_read32(uint32_t addr, uint32_t* out) {
 }
 
 SWDAck swd_write32(uint32_t addr, uint32_t val) {
-    SWDAck result;
+    SWDAck result = swd_set_csw(CSW_SIZE_32);
+    if(result != SWD_ACK_OK) return result;
 
     /* Write TAR */
     result = swd_ap_write(AP_REG_TAR, addr);

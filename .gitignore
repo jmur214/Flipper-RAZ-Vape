@@ -2,3 +2,4 @@ dist/
 firmware/*.elf
 firmware/*.map
 .venv/
+.DS_Store

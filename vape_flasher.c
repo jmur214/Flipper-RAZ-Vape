@@ -187,11 +187,37 @@ static int32_t flash_worker(void* raw_ctx) {
     if(fr != FLASH_OK) {
         swd_disconnect();
         furi_mutex_acquire(app->mutex, FuriWaitForever);
-        snprintf(
-            app->error_msg,
-            sizeof(app->error_msg),
-            "Flash error:\n%s",
-            n32_flash_err_str(fr));
+        if(fr == FLASH_ERR_PROGRAM || fr == FLASH_ERR_ERASE ||
+           fr == FLASH_ERR_PROTECTED) {
+            /* Show the protection state: with read protection on, the flash
+             * reads blank but refuses to program, which otherwise looks like
+             * an inexplicable programming failure. */
+            snprintf(
+                app->error_msg,
+                sizeof(app->error_msg),
+                "blank@%06lX\nval=%08lX\nerDONE=%08lX",
+                (unsigned long)(n32_flash_fail_addr() & 0xFFFFFFUL),
+                (unsigned long)n32_flash_fail_sts(),
+                (unsigned long)n32_flash_er_done());
+        } else if(fr == FLASH_ERR_VERIFY) {
+            /* Show the offending word rather than just "mismatch" — what came
+             * back tells us whether programming, erasing, or the readback is
+             * at fault. */
+            snprintf(
+                app->error_msg,
+                sizeof(app->error_msg),
+                "CTRL=%08lX\nSTS=%08lX\ngot %08lX",
+                (unsigned long)n32_flash_dbg_ctrl(),
+                (unsigned long)n32_flash_dbg_sts(),
+                (unsigned long)n32_flash_verify_actual());
+        } else {
+            snprintf(
+                app->error_msg,
+                sizeof(app->error_msg),
+                "Flash error:\n%s\nACK=%02X",
+                n32_flash_err_str(fr),
+                (unsigned)swd_last_ack_err());
+        }
         app->state = StateError;
         furi_mutex_release(app->mutex);
         view_port_update(wctx->vp);
@@ -255,11 +281,22 @@ static int32_t connect_worker(void* raw_ctx) {
             swd_disconnect();
         }
     } else {
+        /* Passive line probe: distinguishes "no electrical path" (both
+         * lines float — bad contact/ground) from "path exists but target
+         * not answering" (asleep / wrong orientation / no SWD on CC). */
+        uint32_t raw0 = 0, raw1 = 0;
+        swd_raw_capture(&raw0, &raw1);
         snprintf(
             app->error_msg,
             sizeof(app->error_msg),
-            "SWD fail ACK=0x%02X\nFlip USB-C, check\nvape is powered on",
-            (unsigned)result);
+            "ACK=%02X s%u t%u\nID=%08lX\nCS=%08lX",
+            (unsigned)result,
+            (unsigned)swd_last_stage(),
+            (unsigned)swd_last_trn(),
+            (unsigned long)swd_last_idcode(),
+            (unsigned long)swd_last_stat());
+        (void)raw0;
+        (void)raw1;
         app->state = StateError;
     }
 
@@ -324,7 +361,7 @@ static void draw_wiring(Canvas* canvas) {
     /* Separator */
     canvas_draw_line(canvas, 2, 25, 126, 25);
     canvas_draw_str(canvas, 2, 34, "A7 (pin 2)  CC1    SWDIO");
-    canvas_draw_str(canvas, 2, 44, "A6 (pin 3)  CC2    SWCLK");
+    canvas_draw_str(canvas, 2, 44, "C3 (pin 7)  CC2    SWCLK");
     canvas_draw_str(canvas, 2, 54, "GND (pin 8) GND");
 
     canvas_draw_str(canvas, 2, 63, "[OK] Next   [Back] Back");
@@ -445,7 +482,7 @@ static void draw_error(Canvas* canvas, AppCtx* app) {
         line_idx++;
     }
 
-    canvas_draw_str(canvas, 4, 62, "[OK] to exit");
+    canvas_draw_str(canvas, 4, 62, "[OK] Retry   [Back] Exit");
 }
 
 /* ---------------------------------------------------------------------------
@@ -591,14 +628,14 @@ int32_t vape_flasher_app(void* p) {
     app->queue = furi_message_queue_alloc(8, sizeof(InputEvent));
     app->file_path = furi_string_alloc();
     /*
-     * Start the file browser at the SD card root so the user can navigate to
-     * wherever they placed their .bin files.  After the first selection,
-     * app->file_path holds the full file path and the browser reopens with
-     * that file already highlighted — avoiding the Flipper quirk where
-     * entering a bare directory path fails to apply the extension filter on
-     * the first render (requiring a back-out/re-enter to see files).
+     * Seed the browser with a full FILE path rather than a bare directory.
+     * Pointing at a directory triggers a Flipper quirk where the extension
+     * filter is not applied on the first render (the browser comes up empty
+     * and needs a back-out/re-enter to show anything).  Seeding an actual
+     * file makes the browser open in that directory with the file already
+     * highlighted, so a single OK selects it.
      */
-    furi_string_set(app->file_path, STORAGE_EXT_PATH_PREFIX);
+    furi_string_set(app->file_path, STORAGE_EXT_PATH_PREFIX "/vape/slots.bin");
 
     /* ---- Allocate ViewPort ---- */
     ViewPort* vp = view_port_alloc();
@@ -638,6 +675,16 @@ int32_t vape_flasher_app(void* p) {
                 /* drain */
             }
 
+            /*
+             * Hand the screen AND input over to the browser before showing it.
+             * Leaving our own fullscreen ViewPort registered lets the browser
+             * come up underneath it, in which case input keeps being routed to
+             * our queue — which nothing drains, because this thread is blocked
+             * inside dialog_file_browser_show().  The dialog then never returns
+             * and the app hangs hard enough that the loader cannot close it.
+             */
+            gui_remove_view_port(gui, vp);
+
             /* Show file browser */
             DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
             DialogsFileBrowserOptions browser_options;
@@ -647,6 +694,9 @@ int32_t vape_flasher_app(void* p) {
             bool selected =
                 dialog_file_browser_show(dialogs, app->file_path, app->file_path, &browser_options);
             furi_record_close(RECORD_DIALOGS);
+
+            /* Take the screen back */
+            gui_add_view_port(gui, vp, GuiLayerFullscreen);
 
             furi_mutex_acquire(app->mutex, FuriWaitForever);
             if(!selected) {
@@ -790,7 +840,12 @@ int32_t vape_flasher_app(void* p) {
             }
             if(got_event &&
                (event.type == InputTypeShort || event.type == InputTypePress)) {
-                if(event.key == InputKeyOk || event.key == InputKeyBack) {
+                if(event.key == InputKeyOk) {
+                    /* Retry: reopen the file browser (previous file is
+                     * highlighted) so wiring can be iterated without
+                     * re-running the disclaimer each time. */
+                    app->state = StateFilePick;
+                } else if(event.key == InputKeyBack) {
                     running = false;
                 }
             }
