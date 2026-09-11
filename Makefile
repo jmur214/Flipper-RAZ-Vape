@@ -140,9 +140,21 @@ firmware/quickdraw.bin: firmware/quickdraw.elf
 .PHONY: quickdraw
 quickdraw: firmware/quickdraw.bin
 
+# ── dare ──────────────────────────────────────────────────────────────────────
+firmware/dare.elf: $(VAPORWARE_SRC) vaporware/examples/dare/src/dare.c
+	$(CC) $(CFLAGS) -Ivaporware/examples/dare/src $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $^ -o $@
+	$(SIZE) $@
+
+firmware/dare.bin: firmware/dare.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: dare
+dare: firmware/dare.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template dino micro bomb tetris quickdraw
+all: flappy slots template dino micro bomb tetris quickdraw dare
 
 .PHONY: clean
 clean:
