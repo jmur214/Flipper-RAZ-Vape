@@ -154,9 +154,21 @@ firmware/dare.bin: firmware/dare.elf
 .PHONY: dare
 dare: firmware/dare.bin
 
+# ── kings ─────────────────────────────────────────────────────────────────────
+firmware/kings.elf: $(VAPORWARE_SRC) vaporware/examples/kings/src/kings.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $(filter %.c %.s,$^) -o $@
+	$(SIZE) $@
+
+firmware/kings.bin: firmware/kings.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: kings
+kings: firmware/kings.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template dino micro bomb tetris quickdraw dare
+all: flappy slots template dino micro bomb tetris quickdraw dare kings
 
 .PHONY: clean
 clean:
