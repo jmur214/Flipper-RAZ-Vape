@@ -190,9 +190,21 @@ firmware/crawl.bin: firmware/crawl.elf
 .PHONY: crawl
 crawl: firmware/crawl.bin
 
+# ── swarm ─────────────────────────────────────────────────────────────────────
+firmware/swarm.elf: $(VAPORWARE_SRC) vaporware/examples/swarm/src/swarm.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $(filter %.c %.s,$^) -o $@
+	$(SIZE) $@
+
+firmware/swarm.bin: firmware/swarm.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: swarm
+swarm: firmware/swarm.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template dino micro bomb tetris quickdraw dare kings hour crawl
+all: flappy slots template dino micro bomb tetris quickdraw dare kings hour crawl swarm
 
 .PHONY: clean
 clean:
