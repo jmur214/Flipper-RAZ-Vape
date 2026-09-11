@@ -128,9 +128,21 @@ firmware/tetris.bin: firmware/tetris.elf
 .PHONY: tetris
 tetris: firmware/tetris.bin
 
+# ── quickdraw ─────────────────────────────────────────────────────────────────
+firmware/quickdraw.elf: $(VAPORWARE_SRC) vaporware/examples/quickdraw/src/quickdraw.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $^ -o $@
+	$(SIZE) $@
+
+firmware/quickdraw.bin: firmware/quickdraw.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: quickdraw
+quickdraw: firmware/quickdraw.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template dino micro bomb tetris
+all: flappy slots template dino micro bomb tetris quickdraw
 
 .PHONY: clean
 clean:
