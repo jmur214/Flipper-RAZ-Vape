@@ -92,9 +92,33 @@ firmware/dino.bin: firmware/dino.elf
 .PHONY: dino
 dino: firmware/dino.bin
 
+# ── micro ─────────────────────────────────────────────────────────────────────
+firmware/micro.elf: $(VAPORWARE_SRC) vaporware/examples/micro/src/micro.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $^ -o $@
+	$(SIZE) $@
+
+firmware/micro.bin: firmware/micro.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: micro
+micro: firmware/micro.bin
+
+# ── bomb ──────────────────────────────────────────────────────────────────────
+firmware/bomb.elf: $(VAPORWARE_SRC) vaporware/examples/bomb/src/bomb.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $^ -o $@
+	$(SIZE) $@
+
+firmware/bomb.bin: firmware/bomb.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: bomb
+bomb: firmware/bomb.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template dino
+all: flappy slots template dino micro bomb
 
 .PHONY: clean
 clean:
