@@ -141,8 +141,10 @@ firmware/quickdraw.bin: firmware/quickdraw.elf
 quickdraw: firmware/quickdraw.bin
 
 # ── dare ──────────────────────────────────────────────────────────────────────
-firmware/dare.elf: $(VAPORWARE_SRC) vaporware/examples/dare/src/dare.c
-	$(CC) $(CFLAGS) -Ivaporware/examples/dare/src $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $^ -o $@
+# deck.h is a prerequisite so editing the cards actually triggers a rebuild;
+# $^ would then hand the header to gcc as a source, so filter to sources only.
+firmware/dare.elf: $(VAPORWARE_SRC) vaporware/examples/dare/src/dare.c vaporware/examples/dare/src/deck.h
+	$(CC) $(CFLAGS) -Ivaporware/examples/dare/src $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $(filter %.c %.s,$^) -o $@
 	$(SIZE) $@
 
 firmware/dare.bin: firmware/dare.elf
