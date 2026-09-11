@@ -166,9 +166,21 @@ firmware/kings.bin: firmware/kings.elf
 .PHONY: kings
 kings: firmware/kings.bin
 
+# ── hour ──────────────────────────────────────────────────────────────────────
+firmware/hour.elf: $(VAPORWARE_SRC) vaporware/examples/hour/src/hour.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $(filter %.c %.s,$^) -o $@
+	$(SIZE) $@
+
+firmware/hour.bin: firmware/hour.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: hour
+hour: firmware/hour.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template dino micro bomb tetris quickdraw dare kings
+all: flappy slots template dino micro bomb tetris quickdraw dare kings hour
 
 .PHONY: clean
 clean:
