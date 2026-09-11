@@ -178,9 +178,21 @@ firmware/hour.bin: firmware/hour.elf
 .PHONY: hour
 hour: firmware/hour.bin
 
+# ── crawl ─────────────────────────────────────────────────────────────────────
+firmware/crawl.elf: $(VAPORWARE_SRC) vaporware/examples/crawl/src/crawl.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $(filter %.c %.s,$^) -o $@
+	$(SIZE) $@
+
+firmware/crawl.bin: firmware/crawl.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: crawl
+crawl: firmware/crawl.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template dino micro bomb tetris quickdraw dare kings hour
+all: flappy slots template dino micro bomb tetris quickdraw dare kings hour crawl
 
 .PHONY: clean
 clean:
