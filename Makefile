@@ -116,9 +116,21 @@ firmware/bomb.bin: firmware/bomb.elf
 .PHONY: bomb
 bomb: firmware/bomb.bin
 
+# ── tetris ────────────────────────────────────────────────────────────────────
+firmware/tetris.elf: $(VAPORWARE_SRC) vaporware/examples/tetris/src/tetris.c
+	$(CC) $(CFLAGS) $(LDFLAGS_BASE) -Wl,-Map,$(@:.elf=.map) $^ -o $@
+	$(SIZE) $@
+
+firmware/tetris.bin: firmware/tetris.elf
+	$(OBJCOPY) -O binary $< $@
+	@echo "  → $@ ($$(wc -c < $@) bytes)"
+
+.PHONY: tetris
+tetris: firmware/tetris.bin
+
 # ── all / clean ───────────────────────────────────────────────────────────────
 .PHONY: all
-all: flappy slots template dino micro bomb
+all: flappy slots template dino micro bomb tetris
 
 .PHONY: clean
 clean:
