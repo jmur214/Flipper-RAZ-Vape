@@ -104,6 +104,27 @@
 #define POLL_MAX_PROGRAM     50U   /*  5 ms  */
 
 /* ============================================================================
+ * Target watchdog
+ *
+ * The firmware being replaced armed the IWDG at boot (~26 s), and it keeps
+ * counting while the core is halted.  Over SWD a word takes about 6.4 ms to
+ * program and 2.8 ms to verify, so a 28 KB image needs about 70 s.  A reset
+ * during verify goes unnoticed, but one during programming re-locks the flash
+ * controller and leaves a partial image, so anything over roughly 15 KB died
+ * partway through with ACK 00 or 02.  Feeding it from here is the same write
+ * the firmware makes itself.
+ * ========================================================================= */
+
+#define N32_IWDG_KR         0x40003000UL
+#define N32_IWDG_KEY_FEED   0xAAAAUL
+
+static void flash_feed_watchdog(void) {
+    /* A failed feed means the link is down, and the next real operation will
+     * report that with better context. */
+    (void)swd_write32(N32_IWDG_KR, N32_IWDG_KEY_FEED);
+}
+
+/* ============================================================================
  * Cortex-M debug register used for identification
  * ========================================================================= */
 
@@ -526,6 +547,10 @@ FlashResult n32_flash_program(
      *
      * Expect ram16 == 0x5A5AA5A5 and ram32 == 0xDEADBEEF.
      * ------------------------------------------------------------------ */
+    /* The confirm screen has been holding the core halted, so the watchdog
+     * has already been running for as long as that screen was up. */
+    flash_feed_watchdog();
+
     /* Protection state, read before anything else touches the controller. */
     flash_read32(N32_FLASH_OBR, &g_dbg_obr);
     flash_read32(N32_FLASH_WRPR, &g_dbg_wrpr);
@@ -554,6 +579,7 @@ FlashResult n32_flash_program(
     uint32_t erase_total = pages_needed * N32_PAGE_SIZE;
 
     for(uint32_t page = 0; page < pages_needed; page++) {
+        flash_feed_watchdog();
         r = flash_erase_page(page);
         if(r != FLASH_OK) {
             flash_lock();  /* best-effort */
@@ -576,6 +602,8 @@ FlashResult n32_flash_program(
      * ------------------------------------------------------------------ */
     for(uint32_t page = 0; page < pages_needed; page++) {
         uint32_t page_addr = N32_FLASH_ORIGIN + (page * N32_PAGE_SIZE);
+
+        flash_feed_watchdog();
 
         for(uint32_t attempt = 0;; attempt++) {
             bool blank = true;
@@ -664,6 +692,7 @@ FlashResult n32_flash_program(
                             (i + 1U) * 4U,
                             prog_total);
             bytes_since_last_cb = 0;
+            flash_feed_watchdog();
         }
     }
     /* Final progress tick for "Flashing" if last block wasn't on a threshold */
@@ -727,6 +756,7 @@ FlashResult n32_flash_program(
                             (i + 1U) * 4U,
                             prog_total);
             bytes_since_last_cb = 0;
+            flash_feed_watchdog();
         }
     }
     /* Final progress tick for "Verifying" */

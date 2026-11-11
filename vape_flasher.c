@@ -136,6 +136,8 @@ static int32_t flash_worker(void* raw_ctx) {
     WorkerCtx* wctx = raw_ctx;
     AppCtx* app = wctx->app;
 
+    uint32_t start_tick = furi_get_tick();
+
     /* ---- 1. SWD connect ---- */
     SWDAck r = swd_connect();
     if(r != SWD_ACK_OK) {
@@ -211,12 +213,20 @@ static int32_t flash_worker(void* raw_ctx) {
                 (unsigned long)n32_flash_dbg_sts(),
                 (unsigned long)n32_flash_verify_actual());
         } else {
+            /* Where it stopped and how long it had been running is what tells
+             * a target that went away apart from a link that was never good. */
             snprintf(
                 app->error_msg,
                 sizeof(app->error_msg),
-                "Flash error:\n%s\nACK=%02X",
+                "%s\nACK=%02X %s %lu%%\nafter %lus",
                 n32_flash_err_str(fr),
-                (unsigned)swd_last_ack_err());
+                (unsigned)swd_last_ack_err(),
+                app->progress_phase,
+                (unsigned long)(app->progress_total ?
+                                    app->progress_done * 100U / app->progress_total :
+                                    0U),
+                (unsigned long)((furi_get_tick() - start_tick) /
+                                furi_kernel_get_tick_frequency()));
         }
         app->state = StateError;
         furi_mutex_release(app->mutex);
